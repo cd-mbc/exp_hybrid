@@ -62,8 +62,9 @@ class ReplicaConfig {
     public:
     size_t nreplicas;
     size_t nmajority;
+    size_t nmajority_opt;
 
-    ReplicaConfig(): nreplicas(0), nmajority(0) {}
+    ReplicaConfig(): nreplicas(0), nmajority(0), nmajority_opt(0) {}
 
     void add_replica(ReplicaID rid, const ReplicaInfo &info) {
         replica_map.insert(std::make_pair(rid, info));
@@ -132,7 +133,11 @@ class Block {
     bool delivered;
     int8_t decision;
 
-    std::unordered_set<ReplicaID> voted;
+    std::unordered_map<int, std::unordered_set<ReplicaID>> voted;
+    std::unordered_map<int, std::unordered_set<ReplicaID>> svoted;
+    int certified_view = 0;
+    bool certified = false;
+    std::unordered_map<int, std::unordered_map<uint16_t, quorum_cert_bt>> self_certs;
 
     public:
     Block():
@@ -141,12 +146,12 @@ class Block {
         self_qc(nullptr), height(0),
         delivered(false), decision(0) {}
 
-    Block(bool delivered, int8_t decision):
+    Block(bool delivered, int8_t decision, int certified):
         qc(new QuorumCertDummy()),
         hash(salticidae::get_hash(*this)),
         qc_ref(nullptr),
         self_qc(nullptr), height(0),
-        delivered(delivered), decision(decision) {}
+        delivered(delivered), decision(decision), certified(certified) {}
 
     Block(const std::vector<block_t> &parents,
         const std::vector<uint256_t> &cmds,

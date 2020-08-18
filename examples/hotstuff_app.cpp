@@ -63,7 +63,11 @@ using hotstuff::MsgRespCmd;
 using hotstuff::get_hash;
 using hotstuff::promise_t;
 
-using HotStuff = hotstuff::HotStuffSecp256k1;
+#ifndef NO_SIG
+    using HotStuff = hotstuff::HotStuffSecp256k1;
+#else
+    using HotStuff = hotstuff::HotStuffNoSig;
+#endif
 
 class HotStuffApp: public HotStuff {
     double stat_period;
@@ -119,6 +123,7 @@ class HotStuffApp: public HotStuff {
 
     public:
     HotStuffApp(uint32_t blk_size,
+                double delta,    
                 double stat_period,
                 double impeach_timeout,
                 ReplicaID idx,
@@ -262,7 +267,9 @@ int main(int argc, char **argv) {
     clinet_config
         .burst_size(opt_cliburst->get())
         .nworker(opt_clinworker->get());
+    double delta = 0.2;
     papp = new HotStuffApp(opt_blk_size->get(),
+                        delta,    
                         opt_stat_period->get(),
                         opt_imp_timeout->get(),
                         idx,
@@ -295,6 +302,7 @@ int main(int argc, char **argv) {
 }
 
 HotStuffApp::HotStuffApp(uint32_t blk_size,
+                        double delta,
                         double stat_period,
                         double impeach_timeout,
                         ReplicaID idx,
@@ -306,7 +314,7 @@ HotStuffApp::HotStuffApp(uint32_t blk_size,
                         size_t nworker,
                         const Net::Config &repnet_config,
                         const ClientNetwork<opcode_t>::Config &clinet_config):
-    HotStuff(blk_size, idx, raw_privkey,
+    HotStuff(blk_size, delta, idx, raw_privkey,
             plisten_addr, std::move(pmaker), ec, nworker, repnet_config),
     stat_period(stat_period),
     impeach_timeout(impeach_timeout),

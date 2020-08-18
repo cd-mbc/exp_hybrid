@@ -40,6 +40,18 @@ void MsgVote::postponed_parse(HotStuffCore *hsc) {
     vote.hsc = hsc;
     serialized >> vote;
 }
+const opcode_t MsgSVote::opcode;
+MsgSVote::MsgSVote(const SVote &vote) { serialized << vote; }
+void MsgSVote::postponed_parse(HotStuffCore *hsc) {
+    vote.hsc = hsc;
+    serialized >> vote;
+}
+const opcode_t MsgQC::opcode;
+MsgQC::MsgQC(const QC &qc) { serialized << qc; }
+void MsgQC::postponed_parse(HotStuffCore *hsc) {
+    qc.hsc = hsc;
+    serialized >> qc;
+}
 
 const opcode_t MsgReqBlock::opcode;
 MsgReqBlock::MsgReqBlock(const std::vector<uint256_t> &blk_hashes) {
@@ -142,6 +154,20 @@ bool HotStuffBase::on_deliver_blk(const block_t &blk) {
     return res;
 }
 
+void HotStuffBase::set_vote_timer(int view, uint256_t blk_hash, ReplicaID proposer, double t_sec) {
+    auto &timer = vote_timers[view] =
+        TimerEvent(ec, [this, view, blk_hash, proposer](TimerEvent &) {
+            on_vote_timeout(view, blk_hash, proposer);
+            stop_vote_timer(view);
+        });
+    timer.add(t_sec);
+}
+
+void HotStuffBase::stop_vote_timer(int view) {
+    vote_timers.erase(view);
+}
+
+
 promise_t HotStuffBase::async_fetch_blk(const uint256_t &blk_hash,
                                         const PeerId *replica,
                                         bool fetch_now) {
@@ -207,9 +233,17 @@ void HotStuffBase::propose_handler(MsgPropose &&msg, const Net::conn_t &conn) {
     block_t blk = prop.blk;
     if (!blk) return;
     promise::all(std::vector<promise_t>{
-        async_deliver_blk(blk->get_hash(), peer)
-    }).then([this, prop = std::move(prop)]() {
-        on_receive_proposal(prop);
+        async_deliver_blk(blk->get_hash(), peer),
+        async_wait_enter_view(prop.view),
+    }).then([this, prop = std::move(prop), blk]() {
+        async_qc_finish(blk->get_qc_ref()).then([this, prop](){
+            bool not_proposed = (proposed_blks.find(prop.blk->get_hash()) == proposed_blks.end());
+            if (not_proposed && prop.proposer != get_id() ) {
+                do_broadcast_proposal(prop);
+                on_receive_proposal(prop);
+            }            
+        });
+
     });
 }
 
@@ -227,6 +261,33 @@ void HotStuffBase::vote_handler(MsgVote &&msg, const Net::conn_t &conn) {
             LOG_WARN("invalid vote from %d", v->voter);
         else
             on_receive_vote(*v);
+    });
+}
+void HotStuffBase::svote_handler(MsgSVote &&msg, const Net::conn_t &conn) {
+    const auto &peer = conn->get_peer_id();
+    if (peer.is_null()) return;
+    msg.postponed_parse(this);
+    RcObj<SVote> v(new SVote(std::move(msg.vote)));
+    promise::all(std::vector<promise_t>{
+        async_deliver_blk(v->blk_hash, peer),
+        v->verify(vpool),
+    }).then([this, v=std::move(v), msg](const promise::values_t values) {
+        if (!promise::any_cast<bool>(values[1]))
+            LOG_WARN("invalid vote from %d", v->voter);
+        else
+            on_receive_svote(*v);
+    });
+}
+void HotStuffBase::qc_handler(MsgQC &&msg, const Net::conn_t &conn) { 
+    const auto &peer = conn->get_peer_id();
+    if (peer.is_null()) return;
+    msg.postponed_parse(this);
+    RcObj<QC> qc(new QC(std::move(msg.qc)));
+    promise::all(std::vector<promise_t>{
+        async_deliver_blk(qc->qc->get_obj_hash(), peer),
+        qc->verify(vpool)
+    }).then([this, qc](const promise::values_t values) {
+        on_receive_qc(qc->qc);
     });
 }
 
@@ -326,6 +387,7 @@ void HotStuffBase::print_stat() const {
 }
 
 HotStuffBase::HotStuffBase(uint32_t blk_size,
+                    double delta,
                     ReplicaID rid,
                     privkey_bt &&priv_key,
                     NetAddr listen_addr,
@@ -333,7 +395,7 @@ HotStuffBase::HotStuffBase(uint32_t blk_size,
                     EventContext ec,
                     size_t nworker,
                     const Net::Config &netconfig):
-        HotStuffCore(rid, std::move(priv_key)),
+        HotStuffCore(rid, std::move(priv_key), blk_size, delta),
         listen_addr(listen_addr),
         blk_size(blk_size),
         ec(ec),
@@ -356,6 +418,8 @@ HotStuffBase::HotStuffBase(uint32_t blk_size,
     /* register the handlers for msg from replicas */
     pn.reg_handler(salticidae::generic_bind(&HotStuffBase::propose_handler, this, _1, _2));
     pn.reg_handler(salticidae::generic_bind(&HotStuffBase::vote_handler, this, _1, _2));
+    pn.reg_handler(salticidae::generic_bind(&HotStuffBase::svote_handler, this, _1, _2));
+    pn.reg_handler(salticidae::generic_bind(&HotStuffBase::qc_handler, this, _1, _2));
     pn.reg_handler(salticidae::generic_bind(&HotStuffBase::req_blk_handler, this, _1, _2));
     pn.reg_handler(salticidae::generic_bind(&HotStuffBase::resp_blk_handler, this, _1, _2));
     pn.reg_conn_handler(salticidae::generic_bind(&HotStuffBase::conn_handler, this, _1, _2));
@@ -371,16 +435,15 @@ void HotStuffBase::do_broadcast_proposal(const Proposal &prop) {
 }
 
 void HotStuffBase::do_vote(ReplicaID last_proposer, const Vote &vote) {
-    pmaker->beat_resp(last_proposer)
-            .then([this, vote](ReplicaID proposer) {
-        if (proposer == get_id())
-        {
-            throw HotStuffError("unreachable line");
-            //on_receive_vote(vote);
-        }
-        else
-            pn.send_msg(MsgVote(vote), get_config().get_peer_id(proposer));
-    });
+    pn.multicast_msg(MsgVote(vote), peers);
+}
+void HotStuffBase::do_svote(ReplicaID last_proposer, const SVote &vote) {
+    pn.multicast_msg(MsgSVote(vote), peers);
+}
+
+void HotStuffBase::do_broadcast_qc(const quorum_cert_bt &_qc) {
+    QC qc(_qc->clone());
+    pn.multicast_msg(MsgQC(qc), peers);
 }
 
 void HotStuffBase::do_consensus(const block_t &blk) {
@@ -395,7 +458,12 @@ void HotStuffBase::do_decide(Finality &&fin) {
     {
         it->second(std::move(fin));
         decision_waiting.erase(it);
+        decided_cmds.insert(std::make_pair(fin.cmd_hash, true));
     }
+}
+
+void HotStuffBase::enter_view(int _view) {
+    pmaker->enter_view(_view);
 }
 
 HotStuffBase::~HotStuffBase() {}
@@ -419,44 +487,52 @@ void HotStuffBase::start(
         }
     }
 
-    /* ((n - 1) + 1 - 1) / 3 */
-    uint32_t nfaulty = peers.size() / 3;
+    uint32_t nfaulty = ((peers.size()+1) * 2) / 5; /* f/n < 41% */
+    uint32_t nfaulty_opt = (peers.size()) - 2*nfaulty; /* =(n-2f-1)*/
     if (nfaulty == 0)
         LOG_WARN("too few replicas in the system to tolerate any failure");
-    on_init(nfaulty);
+    on_init(nfaulty, nfaulty_opt);
     pmaker->init(this);
     if (ec_loop)
         ec.dispatch();
 
     cmd_pending.reg_handler(ec, [this](cmd_queue_t &q) {
         std::pair<uint256_t, commit_cb_t> e;
+        std::vector<uint256_t> cmds;
+        ReplicaID proposer =  pmaker->get_proposer();
+
         while (q.try_dequeue(e))
         {
-            ReplicaID proposer = pmaker->get_proposer();
 
             const auto &cmd_hash = e.first;
             auto it = decision_waiting.find(cmd_hash);
-            if (it == decision_waiting.end())
+            if (it == decision_waiting.end()) {
                 it = decision_waiting.insert(std::make_pair(cmd_hash, e.second)).first;
-            else
+                cmd_pool.push(cmd_hash);
+            } else {
                 e.second(Finality(id, 0, 0, 0, cmd_hash, uint256_t()));
+            }
             if (proposer != get_id()) continue;
-            cmd_pending_buffer.push(cmd_hash);
-            if (cmd_pending_buffer.size() >= blk_size)
+            if (!pmaker->is_first_propose) continue;
+            cmd_pending_buffer.push(cmd_hash);           
+            
+            if (first_proposal && cmd_pending_buffer.size() >= blk_size)
             {
-                std::vector<uint256_t> cmds;
                 for (uint32_t i = 0; i < blk_size; i++)
                 {
                     cmds.push_back(cmd_pending_buffer.front());
                     cmd_pending_buffer.pop();
                 }
                 pmaker->beat().then([this, cmds = std::move(cmds)](ReplicaID proposer) {
-                    if (proposer == get_id())
+                    if (proposer == get_id()) {
+                        pmaker->is_first_propose = false;
                         on_propose(cmds, pmaker->get_parents());
+                    }
                 });
+                first_proposal = false;
                 return true;
             }
-        }
+        }      
         return false;
     });
 }

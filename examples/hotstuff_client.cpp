@@ -162,7 +162,7 @@ int main(int argc, char **argv) {
         replicas.push_back(NetAddr(NetAddr(_p.first).ip, htons(stoi(_p.second, &_))));
     }
 
-    nfaulty = (replicas.size() - 1) / 3;
+    nfaulty = (replicas.size() * 2) / 5; /* f/n < 41% */
     HOTSTUFF_LOG_INFO("nfaulty = %zu", nfaulty);
     connect_all();
     while (try_send());

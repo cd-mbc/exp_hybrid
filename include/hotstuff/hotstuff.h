@@ -17,6 +17,7 @@
 
 #ifndef _HOTSTUFF_CORE_H
 #define _HOTSTUFF_CORE_H
+#define NO_SIG
 
 #include <queue>
 #include <unordered_map>
@@ -58,6 +59,25 @@ struct MsgVote {
     MsgVote(DataStream &&s): serialized(std::move(s)) {}
     void postponed_parse(HotStuffCore *hsc);
 };
+
+struct MsgSVote {
+    static const opcode_t opcode = 0x6;
+    DataStream serialized;
+    SVote vote;
+    MsgSVote(const SVote &);
+    MsgSVote(DataStream &&s): serialized(std::move(s)) {}
+    void postponed_parse(HotStuffCore *hsc);
+};
+
+struct MsgQC {
+    static const opcode_t opcode = 0x7;
+    DataStream serialized;
+    QC qc;
+    MsgQC(const QC &);
+    MsgQC(DataStream &&s): serialized(std::move(s)) {}
+    void postponed_parse(HotStuffCore *hsc);
+};
+
 
 struct MsgReqBlock {
     static const opcode_t opcode = 0x2;
@@ -161,6 +181,8 @@ class HotStuffBase: public HotStuffCore {
     using cmd_queue_t = salticidae::MPSCQueueEventDriven<std::pair<uint256_t, commit_cb_t>>;
     cmd_queue_t cmd_pending;
     std::queue<uint256_t> cmd_pending_buffer;
+    bool first_proposal = true;
+    std::unordered_map<const uint256_t, std::unordered_map<int, bool>> vote_nums;
 
     /* statistics */
     uint64_t fetched;
@@ -186,6 +208,8 @@ class HotStuffBase: public HotStuffCore {
     inline void propose_handler(MsgPropose &&, const Net::conn_t &);
     /** deliver consensus message: <vote> */
     inline void vote_handler(MsgVote &&, const Net::conn_t &);
+    inline void svote_handler(MsgSVote &&, const Net::conn_t &);
+    inline void qc_handler(MsgQC &&, const Net::conn_t &);
     /** fetches full block data */
     inline void req_blk_handler(MsgReqBlock &&, const Net::conn_t &);
     /** receives a block */
@@ -195,8 +219,14 @@ class HotStuffBase: public HotStuffCore {
 
     void do_broadcast_proposal(const Proposal &) override;
     void do_vote(ReplicaID, const Vote &) override;
+    void do_svote(ReplicaID, const SVote &) override;
+    void do_broadcast_qc(const quorum_cert_bt &qc) override;
     void do_decide(Finality &&) override;
     void do_consensus(const block_t &blk) override;
+
+    void enter_view(int _view) override;
+    void set_vote_timer(int view, uint256_t blk_hash, ReplicaID proposer, double t_sec) override;
+    void stop_vote_timer(int view);
 
     protected:
 
@@ -206,6 +236,7 @@ class HotStuffBase: public HotStuffCore {
 
     public:
     HotStuffBase(uint32_t blk_size,
+            double delta,
             ReplicaID rid,
             privkey_bt &&priv_key,
             NetAddr listen_addr,
@@ -251,12 +282,13 @@ class HotStuff: public HotStuffBase {
     using HotStuffBase::HotStuffBase;
     protected:
 
-    part_cert_bt create_part_cert(const PrivKey &priv_key, const uint256_t &blk_hash) override {
-        HOTSTUFF_LOG_DEBUG("create part cert with priv=%s, blk_hash=%s",
-                            get_hex10(priv_key).c_str(), get_hex10(blk_hash).c_str());
+    part_cert_bt create_part_cert(const PrivKey &priv_key, 
+                                    const uint256_t &blk_hash, 
+                                    const int &view,
+                                    const uint16_t &cert_type) override {
         return new PartCertType(
                     static_cast<const PrivKeyType &>(priv_key),
-                    blk_hash);
+                    blk_hash, view, cert_type);
     }
 
     part_cert_bt parse_part_cert(DataStream &s) override {
@@ -265,8 +297,10 @@ class HotStuff: public HotStuffBase {
         return pc;
     }
 
-    quorum_cert_bt create_quorum_cert(const uint256_t &blk_hash) override {
-        return new QuorumCertType(get_config(), blk_hash);
+    quorum_cert_bt create_quorum_cert(const uint256_t &blk_hash, 
+                                        const int view, 
+                                        const uint16_t cert_type) override {
+        return new QuorumCertType(get_config(), blk_hash, view, cert_type);
     }
 
     quorum_cert_bt parse_quorum_cert(DataStream &s) override {
@@ -277,6 +311,7 @@ class HotStuff: public HotStuffBase {
 
     public:
     HotStuff(uint32_t blk_size,
+            double delta,
             ReplicaID rid,
             const bytearray_t &raw_privkey,
             NetAddr listen_addr,
@@ -285,8 +320,13 @@ class HotStuff: public HotStuffBase {
             size_t nworker = 4,
             const Net::Config &netconfig = Net::Config()):
         HotStuffBase(blk_size,
+                    delta,
                     rid,
+#ifdef NO_SIG
+                    new PrivKeyType(),
+#else
                     new PrivKeyType(raw_privkey),
+#endif
                     listen_addr,
                     std::move(pmaker),
                     ec,
@@ -298,8 +338,12 @@ class HotStuff: public HotStuffBase {
         for (auto &r: replicas)
             reps.push_back(
                 std::make_tuple(
-                    std::get<0>(r),
+                    std::get<0>(r),     
+#ifdef NO_SIG
+                    new PubKeyType(),
+#else                    
                     new PubKeyType(std::get<1>(r)),
+#endif
                     uint256_t(std::get<2>(r))
                 ));
         HotStuffBase::start(std::move(reps), ec_loop);

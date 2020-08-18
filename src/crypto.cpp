@@ -23,13 +23,16 @@ secp256k1_context_t secp256k1_default_sign_ctx = new Secp256k1Context(true);
 secp256k1_context_t secp256k1_default_verify_ctx = new Secp256k1Context(false);
 
 QuorumCertSecp256k1::QuorumCertSecp256k1(
-        const ReplicaConfig &config, const uint256_t &obj_hash):
-            QuorumCert(), obj_hash(obj_hash), rids(config.nreplicas) {
+        const ReplicaConfig &config, const uint256_t &obj_hash,
+        int view, uint16_t cert_type):
+            QuorumCert(), obj_hash(obj_hash), rids(config.nreplicas),
+            view(view), cert_type(cert_type) {
     rids.clear();
 }
    
 bool QuorumCertSecp256k1::verify(const ReplicaConfig &config) {
-    if (sigs.size() < config.nmajority) return false;
+    size_t threshold = (cert_type == 0) ? config.nmajority_opt : config.nmajority;
+    if (sigs.size() < threshold) return false;
     for (size_t i = 0; i < rids.size(); i++)
         if (rids.get(i))
         {
@@ -44,7 +47,8 @@ bool QuorumCertSecp256k1::verify(const ReplicaConfig &config) {
 }
 
 promise_t QuorumCertSecp256k1::verify(const ReplicaConfig &config, VeriPool &vpool) {
-    if (sigs.size() < config.nmajority)
+    size_t threshold = (cert_type == 0) ? config.nmajority_opt : config.nmajority;
+    if (sigs.size() < threshold)
         return promise_t([](promise_t &pm) { pm.resolve(false); });
     std::vector<promise_t> vpm;
     for (size_t i = 0; i < rids.size(); i++)
