@@ -17,7 +17,7 @@
 
 #ifndef _HOTSTUFF_CORE_H
 #define _HOTSTUFF_CORE_H
-#define NO_SIG
+// #define NO_SIG
 
 #include <queue>
 #include <unordered_map>
