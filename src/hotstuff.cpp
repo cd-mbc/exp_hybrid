@@ -46,6 +46,12 @@ void MsgSVote::postponed_parse(HotStuffCore *hsc) {
     vote.hsc = hsc;
     serialized >> vote;
 }
+const opcode_t MsgBlame::opcode;
+MsgBlame::MsgBlame(const Blame &blame) { serialized << blame; }
+void MsgBlame::postponed_parse(HotStuffCore *hsc) {
+    blame.hsc = hsc;
+    serialized >> blame;
+}
 const opcode_t MsgQC::opcode;
 MsgQC::MsgQC(const QC &qc) { serialized << qc; }
 void MsgQC::postponed_parse(HotStuffCore *hsc) {
@@ -167,6 +173,45 @@ void HotStuffBase::stop_vote_timer(int view) {
     vote_timers.erase(view);
 }
 
+void HotStuffBase::set_blame_timer(int view, double t_sec) {
+    auto &timer = blame_timers[view] =
+        TimerEvent(ec, [this, view](TimerEvent &) {
+            on_blame_timeout(view);
+            stop_blame_timer(view);
+        });
+    timer.add(t_sec);
+}
+
+void HotStuffBase::stop_blame_timer(int view) {
+    blame_timers.erase(view);
+}
+
+void HotStuffBase::set_fallback_status_timer(int view, double t_sec) {
+    auto &timer = fallback_status_timers[view] =
+        TimerEvent(ec, [this, view](TimerEvent &) {
+            on_fallback_status_timeout(view);
+            stop_fallback_status_timer(view);            
+        });
+    timer.add(t_sec);
+}
+
+void HotStuffBase::stop_fallback_status_timer(int view) {
+    fallback_status_timers.erase(view);
+}
+
+void HotStuffBase::set_fallback_lock_timer(int view, double t_sec) {
+    auto &timer = fallback_lock_timers[view] =
+        TimerEvent(ec, [this, view](TimerEvent &) {
+            on_fallback_lock_timeout(view);
+            stop_fallback_lock_timer(view);
+        });
+    timer.add(t_sec);
+}
+
+void HotStuffBase::stop_fallback_lock_timer(int view) {
+    fallback_lock_timers.erase(view);
+}
+
 
 promise_t HotStuffBase::async_fetch_blk(const uint256_t &blk_hash,
                                         const PeerId *replica,
@@ -276,6 +321,18 @@ void HotStuffBase::svote_handler(MsgSVote &&msg, const Net::conn_t &conn) {
             LOG_WARN("invalid vote from %d", v->voter);
         else
             on_receive_svote(*v);
+    });
+}
+void HotStuffBase::blame_handler(MsgBlame &&msg, const Net::conn_t &conn) {
+    const NetAddr &peer = conn->get_peer_addr();
+    if (peer.is_null()) return;
+    msg.postponed_parse(this);
+    RcObj<Blame> b(new Blame(std::move(msg.blame)));
+    b->verify(vpool).then([this, b, peer](bool result) {
+        if (!result)
+            LOG_WARN("invalid blame message from %s", std::string(peer).c_str());
+        else
+            on_receive_blame(*b);
     });
 }
 void HotStuffBase::qc_handler(MsgQC &&msg, const Net::conn_t &conn) { 
@@ -419,6 +476,7 @@ HotStuffBase::HotStuffBase(uint32_t blk_size,
     pn.reg_handler(salticidae::generic_bind(&HotStuffBase::propose_handler, this, _1, _2));
     pn.reg_handler(salticidae::generic_bind(&HotStuffBase::vote_handler, this, _1, _2));
     pn.reg_handler(salticidae::generic_bind(&HotStuffBase::svote_handler, this, _1, _2));
+    pn.reg_handler(salticidae::generic_bind(&HotStuffBase::blame_handler, this, _1, _2));    
     pn.reg_handler(salticidae::generic_bind(&HotStuffBase::qc_handler, this, _1, _2));
     pn.reg_handler(salticidae::generic_bind(&HotStuffBase::req_blk_handler, this, _1, _2));
     pn.reg_handler(salticidae::generic_bind(&HotStuffBase::resp_blk_handler, this, _1, _2));
@@ -439,6 +497,9 @@ void HotStuffBase::do_vote(ReplicaID last_proposer, const Vote &vote) {
 }
 void HotStuffBase::do_svote(ReplicaID last_proposer, const SVote &vote) {
     pn.multicast_msg(MsgSVote(vote), peers);
+}
+void HotStuffBase::do_blame(const Blame &blame) {
+    pn.multicast_msg(MsgBlame(blame), peers);
 }
 
 void HotStuffBase::do_broadcast_qc(const quorum_cert_bt &_qc) {
@@ -464,6 +525,7 @@ void HotStuffBase::do_decide(Finality &&fin) {
 
 void HotStuffBase::enter_view(int _view) {
     pmaker->enter_view(_view);
+    set_blame_timer(_view, 8 * delta);
 }
 
 HotStuffBase::~HotStuffBase() {}
@@ -500,6 +562,9 @@ void HotStuffBase::start(
         std::pair<uint256_t, commit_cb_t> e;
         std::vector<uint256_t> cmds;
         ReplicaID proposer =  pmaker->get_proposer();
+
+        if (current_view == 1 && blame_timers.find(1) == blame_timers.end())
+            set_blame_timer(1, 8 * delta);
 
         while (q.try_dequeue(e))
         {

@@ -33,6 +33,7 @@ namespace hotstuff {
 struct Proposal;
 struct Vote;
 struct SVote;
+struct Blame;
 struct Finality;
 
 /** Abstraction for HotStuff protocol state machine (without network implementation). */
@@ -61,6 +62,8 @@ class HotStuffCore {
     public: std::queue<uint256_t> cmd_pool;
     int blk_size;
     double delta;    
+    std::unordered_map<int, std::unordered_set<ReplicaID>> blamed;
+    std::unordered_map<int, quorum_cert_bt> blame_certs;
 
     block_t get_delivered_blk(const uint256_t &blk_hash);
     void sanity_check_delivered(const block_t &blk);
@@ -107,10 +110,20 @@ class HotStuffCore {
      * The block mentioned in the message should be already delivered. */
     void on_receive_vote(const Vote &vote);
     void on_receive_svote(const SVote &vote);
+    void on_receive_blame(const Blame &blame);
     void on_receive_qc(const quorum_cert_bt &qc);
     virtual void set_vote_timer(int view, uint256_t blk_hash, ReplicaID proposer, double t_sec) = 0;
     virtual void stop_vote_timer(int view) = 0;
-    void on_vote_timeout(int view, uint256_t blk_hash, ReplicaID proposer);    
+    virtual void set_blame_timer(int view, double t_sec) = 0;
+    virtual void stop_blame_timer(int view) = 0;    
+    virtual void set_fallback_status_timer(int view, double t_sec) = 0;
+    virtual void stop_fallback_status_timer(int view) = 0;   
+    virtual void set_fallback_lock_timer(int view, double t_sec) = 0;
+    virtual void stop_fallback_lock_timer(int view) = 0;           
+    void on_vote_timeout(int view, uint256_t blk_hash, ReplicaID proposer);   
+    void on_blame_timeout(int view); 
+    void on_fallback_status_timeout(int view);
+    void on_fallback_lock_timeout(int view);
 
     /** Call to submit new commands to be decided (executed). "Parents" must
      * contain at least one block, and the first block is the actual parent,
@@ -136,6 +149,11 @@ class HotStuffCore {
     int locking_view = 0;
     std::unordered_map<uint256_t, bool> proposed_blks;
     std::unordered_map<int, TimerEvent> vote_timers;
+    std::unordered_map<int, TimerEvent> blame_timers;
+    std::unordered_map<int, TimerEvent> fallback_status_timers;
+    std::unordered_map<int, TimerEvent> fallback_lock_timers;
+    bool fallback_status = false;
+    bool fallback_lock = false;
 
     /** Called by HotStuffCore upon broadcasting a new proposal.
      * The user should send the proposal message to all replicas except for
@@ -146,6 +164,7 @@ class HotStuffCore {
      * while safety is always guaranteed by HotStuffCore. */
     virtual void do_vote(ReplicaID last_proposer, const Vote &vote) = 0;
     virtual void do_svote(ReplicaID last_proposer, const SVote &vote) = 0;
+    virtual void do_blame(const Blame &blame) = 0;
     virtual void do_broadcast_qc(const quorum_cert_bt &qc) = 0;    
 
     /* The user plugs in the detailed instances for those
@@ -365,6 +384,74 @@ struct SVote: public Serializable {
           << "rid=" << std::to_string(voter) << " "
           << "view=" << std::to_string(view) << " "
           << "blk=" << get_hex10(blk_hash) << ">";
+        return s;
+    }
+};
+
+struct Blame: public Serializable {
+    ReplicaID blamer;
+    uint256_t view_hash;
+    part_cert_bt cert;
+    
+    /** handle of the core object to allow polymorphism */
+    HotStuffCore *hsc;
+
+    int view;
+
+    Blame(): cert(nullptr), hsc(nullptr) {}
+    Blame(ReplicaID blamer,
+        int view,
+        const uint256_t &view_hash,
+        part_cert_bt &&cert,
+        HotStuffCore *hsc):
+        blamer(blamer),
+        view(view),
+        view_hash(view_hash),
+        cert(std::move(cert)), hsc(hsc) {}
+
+    Blame(const Blame &other):
+        blamer(other.blamer),
+        view(other.view),
+        view_hash(other.view_hash),
+        cert(other.cert ? other.cert->clone() : nullptr),
+        hsc(other.hsc) {}
+
+    Blame(Blame &&other) = default;
+    
+    void serialize(DataStream &s) const override {
+        s << blamer << view << view_hash << *cert;
+    }
+
+    void unserialize(DataStream &s) override {
+        assert(hsc != nullptr);
+        s >> blamer >> view >> view_hash;
+        cert = hsc->parse_part_cert(s);
+    }
+
+    static uint256_t get_view_hash(int _view) {
+        DataStream p;
+        p << _view;
+        return p.get_hash();
+    }
+
+    bool verify() const {
+        assert(hsc != nullptr);
+        return cert->verify(hsc->get_config().get_pubkey(blamer)) &&
+                cert->get_obj_hash() == view_hash;
+    }
+
+    promise_t verify(VeriPool &vpool) const {    
+        assert(hsc != nullptr);
+        return cert->verify(hsc->get_config().get_pubkey(blamer), vpool).then([this](bool result) {
+            return result && cert->get_obj_hash() == view_hash;
+        });
+    }
+
+    operator std::string () const {
+        DataStream s;
+        s << "<blame "
+          << "rid=" << std::to_string(blamer) << " "
+          << "view=" << std::to_string(view) << ">";
         return s;
     }
 };

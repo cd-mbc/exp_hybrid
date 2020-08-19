@@ -224,11 +224,14 @@ void HotStuffCore::on_receive_vote(const Vote &vote) {
 
         if (blk->certified_view >= current_view) {
 
-            locking_view = blk->certified_view;
-            update(blk);
-            current_view = blk->certified_view + 1;
-            on_enter_view_(current_view);
-            enter_view(current_view);
+            if (!fallback_lock)
+                locking_view = blk->certified_view;
+            if (!fallback_status) {
+                update(blk);
+                current_view = blk->certified_view + 1;
+                on_enter_view_(current_view);
+                enter_view(current_view);
+            }
         }    
     }
 }
@@ -263,14 +266,39 @@ void HotStuffCore::on_receive_svote(const SVote &vote) {
         blk->certified = true;
 
         if (blk->certified_view >= current_view) {
-
-            locking_view = blk->certified_view;
-            update(blk);
-            current_view = blk->certified_view + 1;
-            on_enter_view_(current_view);
-            enter_view(current_view);
+            if (!fallback_lock)
+                locking_view = blk->certified_view;
+            if (!fallback_status) {
+                update(blk);
+                current_view = blk->certified_view + 1;
+                on_enter_view_(current_view);
+                enter_view(current_view);
+            }
         }
     
+    }
+}
+
+void HotStuffCore::on_receive_blame(const Blame &blame) {
+    size_t q_size = blamed[blame.view].size();
+    if (q_size >= config.nmajority) return;
+    if (q_size == 0)
+        blame_certs[blame.view] = create_quorum_cert(blame.view_hash, blame.view, 2);
+    if (!blamed[blame.view].insert(blame.blamer).second)
+    {
+        LOG_WARN("duplicate blame for view %d from %d", blame.view, blame.blamer);
+        return;
+    }
+    blame_certs[blame.view]->add_part(blame.blamer, *blame.cert);
+    if (q_size + 1 == config.nmajority) 
+    {
+        blame_certs[blame.view]->compute();
+
+        if (blame.view >= current_view) {
+            fallback_status = true;
+            double t_sec = ((blame.view % config.nreplicas == id) ? 4*delta : 2*delta);
+            set_fallback_status_timer(blame.view, t_sec);
+        }
     }
 }
 
@@ -286,11 +314,14 @@ void HotStuffCore::on_receive_qc(const quorum_cert_bt &qc) {
 
     if (blk->certified_view >= current_view) {
 
-        locking_view = blk->certified_view;
-        update(blk);
-        current_view = blk->certified_view + 1;
-        on_enter_view_(current_view);
-        enter_view(current_view);
+        if (!fallback_lock)
+            locking_view = blk->certified_view;
+        if (!fallback_status) {
+            update(blk);
+            current_view = blk->certified_view + 1;
+            on_enter_view_(current_view);
+            enter_view(current_view);
+        }
     }
 
 }
@@ -303,6 +334,29 @@ void HotStuffCore::on_vote_timeout(int view, uint256_t blk_hash, ReplicaID propo
     }
 }
 
+void HotStuffCore::on_blame_timeout(int view) {
+    if (current_view == view) {
+        do_blame(Blame(id, current_view, Blame::get_view_hash(current_view),
+            create_part_cert(*priv_key, Blame::get_view_hash(current_view), current_view, 2), this));
+    }
+}
+
+void HotStuffCore::on_fallback_status_timeout(int view) {
+    if (current_view <= view) {
+        fallback_lock = true;
+        double t_sec = ((view % config.nreplicas == id) ? 0 : delta);
+        set_fallback_lock_timer(view, t_sec);
+    }
+}
+void HotStuffCore::on_fallback_lock_timeout(int view) {
+    if (current_view <= view) {
+        fallback_status = false;
+        fallback_lock = false;
+        current_view = view + 1;
+        on_enter_view_(current_view);
+        enter_view(current_view);        
+    }
+}
 
 /*** end HotStuff protocol logic ***/
 void HotStuffCore::on_init(uint32_t nfaulty, uint32_t nfaulty_opt) {

@@ -69,6 +69,15 @@ struct MsgSVote {
     void postponed_parse(HotStuffCore *hsc);
 };
 
+struct MsgBlame {
+    static const opcode_t opcode = 0x8;
+    DataStream serialized;
+    Blame blame;
+    MsgBlame(const Blame &);
+    MsgBlame(DataStream &&s): serialized(std::move(s)) {}
+    void postponed_parse(HotStuffCore *hsc);
+};
+
 struct MsgQC {
     static const opcode_t opcode = 0x7;
     DataStream serialized;
@@ -209,6 +218,7 @@ class HotStuffBase: public HotStuffCore {
     /** deliver consensus message: <vote> */
     inline void vote_handler(MsgVote &&, const Net::conn_t &);
     inline void svote_handler(MsgSVote &&, const Net::conn_t &);
+    inline void blame_handler(MsgBlame &&, const Net::conn_t &);
     inline void qc_handler(MsgQC &&, const Net::conn_t &);
     /** fetches full block data */
     inline void req_blk_handler(MsgReqBlock &&, const Net::conn_t &);
@@ -220,13 +230,20 @@ class HotStuffBase: public HotStuffCore {
     void do_broadcast_proposal(const Proposal &) override;
     void do_vote(ReplicaID, const Vote &) override;
     void do_svote(ReplicaID, const SVote &) override;
+    void do_blame(const Blame &) override;
     void do_broadcast_qc(const quorum_cert_bt &qc) override;
     void do_decide(Finality &&) override;
     void do_consensus(const block_t &blk) override;
 
     void enter_view(int _view) override;
     void set_vote_timer(int view, uint256_t blk_hash, ReplicaID proposer, double t_sec) override;
-    void stop_vote_timer(int view);
+    void stop_vote_timer(int view) override;
+    void set_blame_timer(int view, double t_sec) override;
+    void stop_blame_timer(int view) override;
+    void set_fallback_status_timer(int view, double t_sec) override;
+    void stop_fallback_status_timer(int view) override;
+    void set_fallback_lock_timer(int view, double t_sec) override;
+    void stop_fallback_lock_timer(int view) override;    
 
     protected:
 
